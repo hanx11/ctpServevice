@@ -1,0 +1,166 @@
+# -*- coding:utf-8 -*-
+
+import logging
+import time
+from Queue import Empty
+from datetime import datetime
+
+import redis
+
+from constant import *
+from gateway import CtpTdApi
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(threadName)s %(levelname)s || %(asctime)s || %(message)s'
+)
+
+
+class Trader(object):
+    def __init__(self, user_id, password, broker_id, address):
+        self.user_id = user_id
+        self.password = password
+        self.broker_id = broker_id
+        self.address = address
+
+        self.connecting = False
+        self.td_api = CtpTdApi(user_id, password, broker_id, address)
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.order_id_key = 'UNIQUE_ORDER_ID'
+        self.connect_time = None
+
+    def connect(self):
+        self.connecting = True
+        self.connect_time = datetime.now().strftime('%H:%M:%S')
+        logging.info('trader connect_time: %s', self.connect_time)
+        self.td_api.connect()
+
+    def close(self):
+        self.connecting = False
+        self.td_api.close()
+
+    def query_account(self):
+        logging.info('query_account time: %s', time.time())
+        self.td_api.qryAccount()
+
+    def query_position(self):
+        logging.info('query_position time: %s', time.time())
+        self.td_api.qryPosition()
+
+    def get_account(self):
+        return self.td_api.account_queue.get(block=False)
+
+    def get_position(self):
+        return self.td_api.position_queue.get(block=False)
+
+    @property
+    def order_id(self):
+        """
+        :return:
+        """
+        return self.redis.lpop(self.order_id_key)
+
+    def send_order(self, symbol, price, volume, price_type, order_type, trade_date=None):
+        """
+        发单
+        :param symbol:
+        :param price:
+        :param volume:
+        :param price_type: limit or market
+        :param order_type:
+        :param trade_date: 上期所订单平仓时需要，决定平今或平昨
+        :return:
+        """
+        today_str = datetime.today().strftime('%Y%m%d')
+        exchange_id = self.td_api.symbolExchangeDict.get(symbol)
+        if price_type == 'market':
+            order_price_type = PriceType.MARKET_PRICE
+        else:
+            order_price_type = PriceType.LIMIT_PRICE
+
+        direction, offset = Direction.LONG, Offset.OPEN
+        if order_type == OrderType.BUY:
+            direction = Direction.LONG
+            offset = Offset.OPEN
+        elif order_type == OrderType.SELL:
+            direction = Direction.SHORT
+            offset = Offset.CLOSE
+        elif order_type == OrderType.SHORT:
+            direction = Direction.SHORT
+            offset = Offset.OPEN
+        elif order_type == OrderType.COVER:
+            direction = Direction.LONG
+            offset = Offset.CLOSE
+
+        if exchange_id == 'SHFE' and order_type in (OrderType.SELL, OrderType.COVER) and today_str == trade_date:
+            # 上期所平今
+            offset = Offset.CLOSE_TODAY
+        if exchange_id == 'SHFE' and order_type in (OrderType.SELL, OrderType.COVER) and today_str > trade_date:
+            # 上期所平昨
+            offset = Offset.CLOSE_YESTERDAY
+
+        order = {
+            'InstrumentID': symbol,
+            'LimitPrice': float(price),
+            'VolumeTotalOriginal': int(volume),
+            'OrderPriceType': order_price_type,
+            'OrderRef': self.order_id,
+            'Direction': direction,
+            'CombOffsetFlag': offset,
+            'InvestorID': self.user_id,
+            'UserID': self.user_id,
+            'BrokerID': self.broker_id,
+            'CombHedgeFlag': '1',  # 投机单
+            'ContingentCondition': '1',  # 立即发单
+            'ForceCloseReason': '0',  # 非强平
+            'IsAutoSuspend': 0,  # 非自动挂起
+            'TimeCondition': '3',  # 当日有效
+            'VolumeCondition': '1',  # 任何数量
+            'MinVolume': 1,  # 最小成交量为1
+        }
+
+        # if order_type in [OrderType.BUY, OrderType.COVER]:
+        #     order['OrderRef'] = self.order_id
+
+        if price_type == 'FAK':
+            order['OrderPriceType'] = '2'  # 限价
+            order['TimeCondition'] = '1'  # 立即完成，否则撤销
+            order['VolumeCondition'] = '1'  # 任何数量
+        if price_type == 'FOK':
+            order['OrderPriceType'] = '2'  # 限价
+            order['TimeCondition'] = '1'  # 立即完成，否则撤销
+            order['VolumeCondition'] = '3'  # 全部数量
+
+        self.td_api.sendOrder(order)
+
+    def get_order_message(self):
+        try:
+            return self.td_api.order_queue.get(block=False)
+        except Empty:
+            return None
+
+    def cancel_order(self, symbol, order_id, front_id, session_id, investor_id, exchange_id, broker_id):
+        """
+        :param symbol:
+        :param front_id:
+        :param session_id:
+        :param order_id:
+        :param investor_id:
+        :param exchange_id:
+        :param broker_id:
+        :return:
+        """
+        order = {
+            'InstrumentID': symbol,
+            'ExchangeID': exchange_id,
+            'OrderRef': order_id,
+            'FrontID': front_id,
+            'SessionID': session_id,
+            'ActionFlag': '0',  # 删除
+            'BrokerID': broker_id,
+            'InvestorID': investor_id,
+        }
+        self.td_api.cancelOrder(order)
+
+    def order_queue_is_empty(self):
+        return self.td_api.order_queue.empty()
